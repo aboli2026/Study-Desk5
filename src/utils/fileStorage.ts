@@ -1,0 +1,359 @@
+import { StudyFile, FileEdits } from '../types';
+
+const DB_NAME = 'StudyWorkspaceDB';
+const DB_VERSION = 2;
+const STORE_NAME = 'study_files';
+const EDITS_STORE = 'file_edits';
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(EDITS_STORE)) {
+        db.createObjectStore(EDITS_STORE, { keyPath: 'fileId' });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/**
+ * Normalizes file name for duplicate detection (lowercase, trimmed whitespace)
+ */
+export function normalizeFileName(name: string): string {
+  return (name || '').trim().toLowerCase();
+}
+
+/**
+ * Saves a study file to IndexedDB while preventing duplicate file records.
+ * If a file with the same name already exists under another ID, the old record is replaced.
+ */
+export async function saveStudyFileToStorage(file: StudyFile): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_NAME, EDITS_STORE], 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const getAllReq = store.getAll();
+
+    getAllReq.onsuccess = () => {
+      const existingFiles: StudyFile[] = getAllReq.result || [];
+      const targetName = normalizeFileName(file.name);
+      
+      // Look for duplicate records with the same name but different ID
+      const duplicates = existingFiles.filter(
+        (f) => f.id !== file.id && normalizeFileName(f.name) === targetName
+      );
+
+      // Clean up any stale duplicate records
+      if (duplicates.length > 0) {
+        const editStore = tx.objectStore(EDITS_STORE);
+        for (const dup of duplicates) {
+          store.delete(dup.id);
+          editStore.delete(dup.id);
+          try {
+            localStorage.removeItem(`study_edits_${dup.id}`);
+            localStorage.removeItem(`study_notes_${dup.id}`);
+            localStorage.removeItem(`study_strokes_${dup.id}`);
+          } catch {}
+        }
+      }
+
+      store.put(file);
+    };
+
+    getAllReq.onerror = () => {
+      store.put(file);
+    };
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/**
+ * Retrieves all study files, automatically detects duplicate entries by file name,
+ * keeps the richest record (most edits/pages), and cleans up redundant duplicates from IndexedDB.
+ */
+export async function getAllStudyFiles(): Promise<StudyFile[]> {
+  try {
+    const db = await openDB();
+    const rawFiles: StudyFile[] = await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+    });
+
+    if (rawFiles.length === 0) return [];
+
+    // 1. Enrich all files with their latest saved edits
+    const enriched = await Promise.all(
+      rawFiles.map(async (file) => {
+        try {
+          const edits = await getFileEditsFromStorage(file.id);
+          if (edits) {
+            return {
+              ...file,
+              pageCount: edits.pageCount ?? file.pageCount,
+              currentPage: edits.currentPage ?? file.currentPage,
+              pageStrokes: edits.pageStrokes ?? file.pageStrokes,
+              stickyNotes: edits.stickyNotes ?? file.stickyNotes,
+              scale: edits.scale ?? file.scale,
+              lastModified: edits.updatedAt ?? file.lastModified,
+            };
+          }
+        } catch {}
+        return file;
+      })
+    );
+
+    // 2. Group files by normalized name to detect duplicates
+    const filesByName = new Map<string, StudyFile[]>();
+    for (const file of enriched) {
+      const key = normalizeFileName(file.name);
+      const list = filesByName.get(key) || [];
+      list.push(file);
+      filesByName.set(key, list);
+    }
+
+    const uniqueFiles: StudyFile[] = [];
+    const duplicateIdsToDelete: string[] = [];
+
+    for (const [, fileList] of filesByName.entries()) {
+      if (fileList.length === 1) {
+        uniqueFiles.push(fileList[0]);
+      } else {
+        // Sort duplicates: prioritize the one with highest page progress, notes, strokes, and newest date
+        fileList.sort((a, b) => {
+          const scoreA =
+            (a.currentPage && a.currentPage > 1 ? a.currentPage * 20 : 0) +
+            (a.stickyNotes?.length || 0) * 10 +
+            Object.keys(a.pageStrokes || {}).length * 5 +
+            (a.lastModified ? new Date(a.lastModified).getTime() : 0);
+
+          const scoreB =
+            (b.currentPage && b.currentPage > 1 ? b.currentPage * 20 : 0) +
+            (b.stickyNotes?.length || 0) * 10 +
+            Object.keys(b.pageStrokes || {}).length * 5 +
+            (b.lastModified ? new Date(b.lastModified).getTime() : 0);
+
+          return scoreB - scoreA;
+        });
+
+        // The top file is the best file to keep
+        const bestFile = fileList[0];
+        uniqueFiles.push(bestFile);
+
+        // Queue all other redundant duplicate copies for permanent deletion
+        for (let i = 1; i < fileList.length; i++) {
+          duplicateIdsToDelete.push(fileList[i].id);
+        }
+      }
+    }
+
+    // 3. Remove redundant duplicate records from IndexedDB and localStorage
+    if (duplicateIdsToDelete.length > 0) {
+      try {
+        const cleanupTx = db.transaction([STORE_NAME, EDITS_STORE], 'readwrite');
+        const fileStore = cleanupTx.objectStore(STORE_NAME);
+        const editStore = cleanupTx.objectStore(EDITS_STORE);
+        for (const dupId of duplicateIdsToDelete) {
+          fileStore.delete(dupId);
+          editStore.delete(dupId);
+          try {
+            localStorage.removeItem(`study_edits_${dupId}`);
+            localStorage.removeItem(`study_notes_${dupId}`);
+            localStorage.removeItem(`study_strokes_${dupId}`);
+          } catch {}
+        }
+      } catch (err) {
+        console.warn('Failed cleaning up duplicate records:', err);
+      }
+    }
+
+    return uniqueFiles;
+  } catch (err) {
+    console.error('Failed to get files from IndexedDB:', err);
+    return [];
+  }
+}
+
+export async function getStudyFileById(id: string): Promise<StudyFile | null> {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get(id);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error(`Failed to get file ${id} from IndexedDB:`, err);
+    return null;
+  }
+}
+
+export async function deleteStudyFileFromStorage(id: string, fileName?: string): Promise<void> {
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE_NAME, EDITS_STORE], 'readwrite');
+      const fileStore = tx.objectStore(STORE_NAME);
+      const editStore = tx.objectStore(EDITS_STORE);
+
+      fileStore.delete(id);
+      editStore.delete(id);
+
+      // If fileName provided, delete any ghost duplicates with the same name
+      if (fileName) {
+        const getAllReq = fileStore.getAll();
+        getAllReq.onsuccess = () => {
+          const files: StudyFile[] = getAllReq.result || [];
+          const target = normalizeFileName(fileName);
+          for (const f of files) {
+            if (normalizeFileName(f.name) === target) {
+              fileStore.delete(f.id);
+              editStore.delete(f.id);
+              try {
+                localStorage.removeItem(`study_edits_${f.id}`);
+                localStorage.removeItem(`study_notes_${f.id}`);
+                localStorage.removeItem(`study_strokes_${f.id}`);
+              } catch {}
+            }
+          }
+        };
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error('Failed to delete file from IndexedDB:', err);
+  }
+
+  // Clear localStorage caches
+  try {
+    localStorage.removeItem(`study_edits_${id}`);
+    localStorage.removeItem(`study_notes_${id}`);
+    localStorage.removeItem(`study_strokes_${id}`);
+  } catch {}
+}
+
+/**
+ * Saves all edits (drawing strokes, sticky notes, current page position, scale) for a file.
+ * Saves to IndexedDB (with practically unlimited space) and synchronously backups to localStorage.
+ */
+export async function saveFileEditsToStorage(fileId: string, edits: FileEdits): Promise<void> {
+  if (!fileId) return;
+
+  const payload: FileEdits = {
+    fileId,
+    pageStrokes: edits.pageStrokes || {},
+    stickyNotes: edits.stickyNotes || [],
+    currentPage: edits.currentPage || 1,
+    pageCount: edits.pageCount,
+    scale: edits.scale,
+    updatedAt: edits.updatedAt || new Date().toISOString(),
+  };
+
+  // 1. Fast synchronous backup in localStorage
+  try {
+    localStorage.setItem(`study_edits_${fileId}`, JSON.stringify(payload));
+    // Keep legacy keys updated for backwards compatibility
+    localStorage.setItem(`study_notes_${fileId}`, JSON.stringify(payload.stickyNotes));
+    localStorage.setItem(`study_strokes_${fileId}`, JSON.stringify(payload.pageStrokes));
+  } catch (e) {
+    // If localStorage quota exceeded, IndexedDB will still save safely
+    console.warn('LocalStorage quota or write issue (will persist in IndexedDB):', e);
+  }
+
+  // 2. High capacity IndexedDB storage
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([EDITS_STORE, STORE_NAME], 'readwrite');
+      const editStore = tx.objectStore(EDITS_STORE);
+      editStore.put(payload);
+
+      const fileStore = tx.objectStore(STORE_NAME);
+      const getFileReq = fileStore.get(fileId);
+      getFileReq.onsuccess = () => {
+        const existingFile = getFileReq.result as StudyFile | undefined;
+        if (existingFile) {
+          existingFile.currentPage = payload.currentPage;
+          if (payload.pageCount) existingFile.pageCount = payload.pageCount;
+          existingFile.pageStrokes = payload.pageStrokes;
+          existingFile.stickyNotes = payload.stickyNotes;
+          existingFile.scale = payload.scale;
+          existingFile.lastModified = payload.updatedAt;
+          fileStore.put(existingFile);
+        }
+      };
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error(`Failed to save edits for file ${fileId} in IndexedDB:`, err);
+  }
+}
+
+/**
+ * Loads all saved edits for a file from IndexedDB or localStorage.
+ */
+export async function getFileEditsFromStorage(fileId: string): Promise<FileEdits | null> {
+  if (!fileId) return null;
+
+  // 1. Attempt reading from IndexedDB
+  try {
+    const db = await openDB();
+    const result: FileEdits | null = await new Promise((resolve, reject) => {
+      const tx = db.transaction(EDITS_STORE, 'readonly');
+      const store = tx.objectStore(EDITS_STORE);
+      const request = store.get(fileId);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+
+    if (result && (result.pageStrokes || result.stickyNotes || result.currentPage || result.pageCount)) {
+      return result;
+    }
+  } catch (err) {
+    console.warn(`IndexedDB read edits for ${fileId} failed, falling back to localStorage:`, err);
+  }
+
+  // 2. Fallback to localStorage
+  try {
+    const unified = localStorage.getItem(`study_edits_${fileId}`);
+    if (unified) {
+      return JSON.parse(unified);
+    }
+
+    // 3. Fallback to legacy separate localStorage items
+    const legacyNotes = localStorage.getItem(`study_notes_${fileId}`);
+    const legacyStrokes = localStorage.getItem(`study_strokes_${fileId}`);
+
+    if (legacyNotes || legacyStrokes) {
+      return {
+        fileId,
+        pageStrokes: legacyStrokes ? JSON.parse(legacyStrokes) : {},
+        stickyNotes: legacyNotes ? JSON.parse(legacyNotes) : [],
+        currentPage: 1,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  } catch (e) {
+    console.error('Failed reading edits from localStorage fallback:', e);
+  }
+
+  return null;
+}
